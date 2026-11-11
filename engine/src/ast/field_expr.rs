@@ -8,8 +8,8 @@ use crate::filter::{CompiledExpr, CompiledOneExpr, CompiledVecExpr};
 use crate::lex::{Lex, LexErrorKind, LexResult, LexWith, expect, skip_space, span};
 use crate::lhs_types::TypedArray;
 use crate::range_set::RangeSet;
-use crate::rhs_types::{BytesExpr, ExplicitIpRange, ListName, Regex, Wildcard};
-use crate::scheme::{Field, Identifier, List};
+use crate::rhs_types::{BytesExpr, ExplicitIpRange, IpRange, ListName, Regex, Wildcard};
+use crate::scheme::{Field, FieldIndex, Identifier, List};
 use crate::searcher::{EmptySearcher, MemmemSearcher};
 use crate::strict_partial_ord::StrictPartialOrd;
 use crate::types::{
@@ -545,7 +545,9 @@ impl<'i, 's> LexWith<'i, &FilterParser<'s>> for IdentifierExpr {
         match item {
             Identifier::Field(field) => Ok((IdentifierExpr::Field(field.to_owned()), input)),
             Identifier::Function(function) => {
-                let nested_parser = parser.with_increased_nesting(skip_space(input))?;
+                let nested_parser = parser
+                    .with_increased_nesting(skip_space(input))?
+                    .in_array_argument();
                 FunctionCallExpr::lex_with_function(input, &nested_parser, function)
                     .map(|(call, input)| (IdentifierExpr::FunctionCallExpr(call), input))
             }
@@ -598,8 +600,17 @@ impl ComparisonExpr {
     pub(crate) fn lex_with_lhs<'i>(
         input: &'i str,
         parser: &FilterParser<'_>,
-        lhs: IndexExpr,
+        mut lhs: IndexExpr,
     ) -> LexResult<'i, Self> {
+        if parser.settings.implicit_map_each
+            && let Type::Array(element) = lhs.get_type()
+            && matches!(Type::from(element), Type::Bytes | Type::Int | Type::Ip)
+        {
+            let mut indexes = lhs.indexes.into_vec();
+            indexes.push(FieldIndex::MapEach);
+            lhs.indexes = indexes.into_boxed_slice();
+        }
+
         let lhs_type = lhs.get_type();
 
         let (op, input) = if lhs_type == Type::Bool {
@@ -625,12 +636,21 @@ impl ComparisonExpr {
 
             let input = skip_space(input);
 
+            if let (true, Type::Ip | Type::Int, ComparisonOp::Ordering(op)) =
+                (parser.settings.quoted_literals, &lhs_type, op)
+                && let Some((content, rest)) = quoted(input)
+            {
+                let op = lex_quoted_literal(content, &lhs_type, op)?;
+                return Ok((ComparisonExpr { lhs, op }, rest));
+            }
+
             match (&lhs_type, op) {
                 (Type::Ip, ComparisonOp::In)
                 | (Type::Bytes, ComparisonOp::In)
                 | (Type::Int, ComparisonOp::In) => {
                     if expect(input, "$").is_ok() {
-                        let (name, input) = ListName::lex(input)?;
+                        let (name, input) =
+                            ListName::lex_with_hyphens(input, parser.settings.list_name_hyphens)?;
                         let list = parser.scheme.get_list(&lhs_type).ok_or((
                             LexErrorKind::UnsupportedOp { lhs_type },
                             span(initial_input, input),
@@ -699,6 +719,41 @@ impl ComparisonExpr {
     pub fn operator(&self) -> &ComparisonOpExpr {
         &self.op
     }
+}
+
+/// The text between a pair of double quotes at the start of `input`, and what follows; `None`
+/// when `input` does not start with one or the text holds an escape.
+fn quoted(input: &str) -> Option<(&str, &str)> {
+    let body = expect(input, "\"").ok()?;
+    let end = body.find('"')?;
+    let content = &body[..end];
+    (!content.contains('\\')).then(|| (content, &body[end + 1..]))
+}
+
+/// A quoted literal for an IP or integer field: the literal itself, or for an IP field's
+/// `==` a CIDR or range, which matches an address within it.
+fn lex_quoted_literal<'i>(
+    content: &'i str,
+    lhs_type: &Type,
+    op: OrderingOp,
+) -> Result<ComparisonOpExpr, (LexErrorKind, &'i str)> {
+    if *lhs_type == Type::Ip && (content.contains('/') || content.contains("..")) {
+        if op != OrderingOp::Equal {
+            return Err((
+                LexErrorKind::UnsupportedOp {
+                    lhs_type: *lhs_type,
+                },
+                content,
+            ));
+        }
+        let range = crate::lex::complete(IpRange::lex(content))?;
+        return Ok(ComparisonOpExpr::OneOf(LiteralSet::Ip(vec![range])));
+    }
+    let value = crate::lex::complete(LiteralValue::lex_with(content, *lhs_type))?;
+    Ok(ComparisonOpExpr::Ordering {
+        op,
+        rhs: ComparisonRhs::Literal(value),
+    })
 }
 
 macro_rules! cast_value {
@@ -1979,6 +2034,56 @@ mod tests {
         ctx.set_field_value(field("http.host"), "example.org")
             .unwrap();
         assert_eq!(expr.execute_one(ctx), true);
+    }
+
+    #[test]
+    fn test_quoted_literals() {
+        let settings = crate::ParserSettings {
+            quoted_literals: true,
+            ..Default::default()
+        };
+        let parser = FilterParser::with_settings(&SCHEME, settings);
+        let lex = |src: &str| crate::lex::complete(parser.lex_as::<ComparisonExpr>(src)).unwrap();
+        let plain = |src: &str| {
+            crate::lex::complete(FilterParser::new(&SCHEME).lex_as::<ComparisonExpr>(src)).unwrap()
+        };
+
+        assert_eq!(lex(r#"tcp.port == "2222""#), plain("tcp.port == 2222"));
+        assert_eq!(
+            lex(r#"ip.addr == "10.0.0.1""#),
+            plain("ip.addr == 10.0.0.1")
+        );
+        assert_eq!(
+            lex(r#"ip.addr == "192.168.86.0/27""#),
+            plain("ip.addr in {192.168.86.0/27}")
+        );
+
+        let expr = lex(r#"ip.addr == "192.168.86.0/27""#).compile();
+        let ctx = &mut ExecutionContext::new(&SCHEME);
+        ctx.set_field_value(field("ip.addr"), IpAddr::from([192, 168, 86, 31]))
+            .unwrap();
+        assert_eq!(expr.execute_one(ctx), true);
+        ctx.set_field_value(field("ip.addr"), IpAddr::from([192, 168, 86, 32]))
+            .unwrap();
+        assert_eq!(expr.execute_one(ctx), false);
+
+        // A range only under `==`, and nothing but the literal in the quotes.
+        assert!(
+            parser
+                .lex_as::<ComparisonExpr>(r#"ip.addr != "192.168.86.0/27""#)
+                .is_err()
+        );
+        assert!(
+            parser
+                .lex_as::<ComparisonExpr>(r#"tcp.port == "22 ""#)
+                .is_err()
+        );
+        // Not without the setting.
+        assert!(
+            FilterParser::new(&SCHEME)
+                .lex_as::<ComparisonExpr>(r#"tcp.port == "2222""#)
+                .is_err()
+        );
     }
 
     #[test]

@@ -13,6 +13,13 @@ impl From<String> for ListName {
 
 impl Lex<'_> for ListName {
     fn lex(input: &str) -> LexResult<'_, Self> {
+        Self::lex_with_hyphens(input, false)
+    }
+}
+
+impl ListName {
+    /// Lexes a list name, taking `-` as a name character when `hyphens` is set.
+    pub(crate) fn lex_with_hyphens(input: &str, hyphens: bool) -> LexResult<'_, Self> {
         let mut res = String::new();
         let mut rest;
         let input = expect(input, "$")?;
@@ -22,6 +29,7 @@ impl Lex<'_> for ListName {
             match iter.next() {
                 Some(c) => match c {
                     'a'..='z' | '0'..='9' | '_' | '.' => res.push(c),
+                    '-' if hyphens => res.push(c),
                     _ => {
                         if res.is_empty() {
                             return Err((
@@ -103,6 +111,21 @@ mod test {
             ListName::lex("$hello"),
             ListName::from("hello".to_string()),
             ""
+        );
+    }
+
+    #[test]
+    fn hyphens() {
+        assert_ok!(
+            ListName::lex("$01302951-49f9-47c9-a400-0297e60b6a10;"),
+            ListName::from("01302951".to_string()),
+            "-49f9-47c9-a400-0297e60b6a10;"
+        );
+
+        assert_ok!(
+            ListName::lex_with_hyphens("$01302951-49f9-47c9-a400-0297e60b6a10;", true),
+            ListName::from("01302951-49f9-47c9-a400-0297e60b6a10".to_string()),
+            ";"
         );
     }
 

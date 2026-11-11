@@ -1,5 +1,5 @@
 use super::Expr;
-use super::field_expr::ComparisonExpr;
+use super::field_expr::{ComparisonExpr, ComparisonOpExpr};
 use super::function_expr::FunctionCallArgExpr;
 use super::index_expr::IndexExpr;
 use super::parse::FilterParser;
@@ -212,7 +212,7 @@ impl LogicalExpr {
     ) -> Option<LexResult<'i, (QuantifierOp, Box<QuantifierArgExpr>)>> {
         let (op, rest) = QuantifierOp::lex_call(input)?;
         let nested_parser = match parser.with_increased_nesting(skip_space(rest)) {
-            Ok(parser) => parser,
+            Ok(parser) => parser.in_array_argument(),
             Err(err) => return Some(Err(err)),
         };
         Some((|| {
@@ -253,7 +253,35 @@ impl LogicalExpr {
             (LogicalExpr::Quantifier { op, arg }, input)
         } else {
             let (op, input) = ComparisonExpr::lex_with(input, parser)?;
-            (LogicalExpr::Comparison(op), input)
+            if parser.settings.implicit_any
+                && !parser.in_array_argument
+                && op.lhs.map_each_count() > 0
+            {
+                return Ok((
+                    LogicalExpr::Quantifier {
+                        op: QuantifierOp::Any,
+                        arg: Box::new(QuantifierArgExpr::Logical(LogicalExpr::Comparison(op))),
+                    },
+                    input,
+                ));
+            }
+            let is_bool = op.get_type() == Type::Bool && op.op == ComparisonOpExpr::IsTrue;
+            let literal = if is_bool && parser.settings.bool_literal_comparison {
+                lex_bool_literal_comparison(input)
+            } else {
+                None
+            };
+            match literal {
+                Some((true, input)) => (LogicalExpr::Comparison(op), input),
+                Some((false, input)) => (
+                    LogicalExpr::Unary {
+                        op: UnaryOp::Not,
+                        arg: Box::new(LogicalExpr::Comparison(op)),
+                    },
+                    input,
+                ),
+                None => (LogicalExpr::Comparison(op), input),
+            }
         })
     }
 
@@ -321,6 +349,31 @@ impl LogicalExpr {
 
         Ok((lhs, lookahead.1))
     }
+}
+
+/// `== true`, `!= false` (the field itself, `true`) or `== false`, `!= true` (its negation,
+/// `false`) after a Bool field, with what follows.
+fn lex_bool_literal_comparison(input: &str) -> Option<(bool, &str)> {
+    let rest = skip_space(input);
+    let (equal, rest) = if let Ok(rest) = expect(rest, "==").or_else(|_| expect(rest, "eq ")) {
+        (true, rest)
+    } else if let Ok(rest) = expect(rest, "!=").or_else(|_| expect(rest, "ne ")) {
+        (false, rest)
+    } else {
+        return None;
+    };
+    let rest = skip_space(rest);
+    let (value, rest) = if let Ok(rest) = expect(rest, "true") {
+        (true, rest)
+    } else if let Ok(rest) = expect(rest, "false") {
+        (false, rest)
+    } else {
+        return None;
+    };
+    if rest.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return None;
+    }
+    Some((equal == value, rest))
 }
 
 impl<'i, 's> LexWith<'i, &FilterParser<'s>> for LogicalExpr {
@@ -1205,4 +1258,105 @@ fn test() {
 
         assert_eq!(expr.execute_one(ctx), false);
     }
+}
+
+#[test]
+fn test_bool_literal_comparison() {
+    use crate::lex::complete;
+
+    let scheme = &Scheme! { t: Bool }.build();
+    let settings = crate::ParserSettings {
+        bool_literal_comparison: true,
+        ..Default::default()
+    };
+    let parser = FilterParser::with_settings(scheme, settings);
+    let t = || LogicalExpr::Comparison(complete(FilterParser::new(scheme).lex_as("t")).unwrap());
+    let not_t = || LogicalExpr::Unary {
+        op: UnaryOp::Not,
+        arg: Box::new(t()),
+    };
+
+    assert_ok!(parser.lex_as("t == true"), t());
+    assert_ok!(parser.lex_as("t != false"), t());
+    assert_ok!(parser.lex_as("t == false"), not_t());
+    assert_ok!(parser.lex_as("t != true"), not_t());
+    assert_ok!(
+        parser.lex_as("t == true and t"),
+        LogicalExpr::Combining {
+            op: LogicalOp::And,
+            items: vec![t(), t()],
+        }
+    );
+    // A word that only starts with `true` is not the literal.
+    assert_ok!(parser.lex_as("t == truest"), t(), " == truest");
+    // Not without the setting.
+    assert_ok!(
+        FilterParser::new(scheme).lex_as("t == true"),
+        t(),
+        " == true"
+    );
+}
+
+#[test]
+fn test_implicit_any() {
+    use crate::lex::complete;
+
+    let scheme = &Scheme! { ips: Array(Ip), t: Bool }.build();
+    let settings = crate::ParserSettings {
+        implicit_any: true,
+        ..Default::default()
+    };
+    let parser = FilterParser::with_settings(scheme, settings);
+    let any = |src: &str| complete(FilterParser::new(scheme).lex_as::<LogicalExpr>(src)).unwrap();
+
+    assert_ok!(
+        parser.lex_as("ips[*] in {10.0.0.0/8}"),
+        any("any(ips[*] in {10.0.0.0/8})")
+    );
+    assert_ok!(
+        parser.lex_as("not ips[*] in {10.0.0.0/8} and t"),
+        any("not any(ips[*] in {10.0.0.0/8}) and t")
+    );
+    // An explicit quantifier is unchanged.
+    assert_ok!(
+        parser.lex_as("all(ips[*] in {10.0.0.0/8})"),
+        any("all(ips[*] in {10.0.0.0/8})")
+    );
+    // Without the setting the comparison is an array, which a filter refuses.
+    assert!(
+        FilterParser::new(scheme)
+            .parse("ips[*] in {10.0.0.0/8}")
+            .is_err()
+    );
+    assert!(parser.parse("ips[*] in {10.0.0.0/8}").is_ok());
+}
+
+#[test]
+fn test_implicit_map_each() {
+    use crate::lex::complete;
+
+    let scheme = &Scheme! { ips: Array(Ip), attrs: Map(Array(Bytes)) }.build();
+    let settings = crate::ParserSettings {
+        implicit_map_each: true,
+        implicit_any: true,
+        ..Default::default()
+    };
+    let parser = FilterParser::with_settings(scheme, settings);
+    let plain = |src: &str| complete(FilterParser::new(scheme).lex_as::<LogicalExpr>(src)).unwrap();
+
+    assert_ok!(
+        parser.lex_as("ips == 10.0.0.1"),
+        plain("any(ips[*] == 10.0.0.1)")
+    );
+    assert_ok!(
+        parser.lex_as(r#"any(attrs["name"] in {"Test User"})"#),
+        plain(r#"any(attrs["name"][*] in {"Test User"})"#)
+    );
+    // An explicit [*] is not mapped twice.
+    assert_ok!(
+        parser.lex_as("ips[*] == 10.0.0.1"),
+        plain("any(ips[*] == 10.0.0.1)")
+    );
+    // Not without the setting.
+    assert!(FilterParser::new(scheme).parse("ips == 10.0.0.1").is_err());
 }

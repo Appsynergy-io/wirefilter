@@ -341,14 +341,25 @@ impl<'i, 's> LexWith<'i, &FilterParser<'s>> for IndexExpr {
 
         input = rest;
 
-        while let Ok(rest) = expect(input, "[") {
-            let rest = skip_space(rest);
+        loop {
+            let (idx, rest) = if let Ok(rest) = expect(input, "[") {
+                let rest = skip_space(rest);
 
-            let (idx, rest) = FieldIndex::lex(rest)?;
+                let (idx, rest) = FieldIndex::lex(rest)?;
 
-            let mut rest = skip_space(rest);
+                let rest = skip_space(rest);
 
-            rest = expect(rest, "]")?;
+                (idx, expect(rest, "]")?)
+            } else if let Some((key, rest)) = parser
+                .settings
+                .member_access
+                .then(|| lex_member(input, &indexes, &current_type))
+                .flatten()
+            {
+                (FieldIndex::MapKey(key.into()), rest)
+            } else {
+                break;
+            };
 
             match &idx {
                 FieldIndex::ArrayIndex(_) => match current_type {
@@ -411,6 +422,23 @@ impl<'i, 's> LexWith<'i, &FilterParser<'s>> for IndexExpr {
             input,
         ))
     }
+}
+
+/// `.name` after an index into a map: the key `name`. The name is what Cloudflare's Gateway
+/// selectors use after one, lowercase letters, digits and `_`.
+fn lex_member<'i>(
+    input: &'i str,
+    indexes: &[FieldIndex],
+    current_type: &Type,
+) -> Option<(&'i str, &'i str)> {
+    if indexes.is_empty() || !matches!(current_type, Type::Map(_)) {
+        return None;
+    }
+    let rest = expect(input, ".").ok()?;
+    let len = rest
+        .find(|c: char| !matches!(c, 'a'..='z' | '0'..='9' | '_'))
+        .unwrap_or(rest.len());
+    (len > 0).then(|| (&rest[..len], &rest[len..]))
 }
 
 impl GetType for IndexExpr {
@@ -655,6 +683,50 @@ mod tests {
                 identifier: IdentifierExpr::Field(SCHEME.get_field("map").unwrap().to_owned()),
                 indexes: Box::new([FieldIndex::MapKey("😍".into())]),
             }
+        );
+    }
+
+    #[test]
+    fn test_member_access() {
+        let scheme = {
+            let mut builder = SchemeBuilder::new();
+            builder
+                .add_field("groups", Type::Array(Type::Map(Type::Bytes.into()).into()))
+                .unwrap();
+            builder.build()
+        };
+        let groups = || IdentifierExpr::Field(scheme.get_field("groups").unwrap().to_owned());
+        let settings = crate::ParserSettings {
+            member_access: true,
+            ..Default::default()
+        };
+
+        assert_ok!(
+            FilterParser::with_settings(&scheme, settings.clone()).lex_as("groups[*].id"),
+            IndexExpr {
+                identifier: groups(),
+                indexes: Box::new([FieldIndex::MapEach, FieldIndex::MapKey("id".into())]),
+            }
+        );
+
+        // Only after an index, and only into a map.
+        assert_ok!(
+            FilterParser::with_settings(&scheme, settings).lex_as("groups[0].id.x"),
+            IndexExpr {
+                identifier: groups(),
+                indexes: Box::new([FieldIndex::ArrayIndex(0), FieldIndex::MapKey("id".into())]),
+            },
+            ".x"
+        );
+
+        // Not without the setting.
+        assert_ok!(
+            FilterParser::new(&scheme).lex_as("groups[*].id"),
+            IndexExpr {
+                identifier: groups(),
+                indexes: Box::new([FieldIndex::MapEach]),
+            },
+            ".id"
         );
     }
 

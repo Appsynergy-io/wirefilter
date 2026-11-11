@@ -112,6 +112,41 @@ pub struct ParserSettings {
     /// Maximum nesting depth allowed while parsing.
     /// Default: 128
     pub max_nesting_depth: u16,
+    /// Whether a list name may contain `-`, as Cloudflare Gateway's list references do:
+    /// `http.request.host in $01302951-49f9-47c9-a400-0297e60b6a10`
+    /// (developers.cloudflare.com/api, zero-trust-gateway_traffic).
+    /// Default: false
+    pub list_name_hyphens: bool,
+    /// Whether `.name` after an index takes the key `name` of the map it reaches, as Cloudflare
+    /// Gateway's identity selectors do: `any(identity.groups[*].id in {"group_id"})`
+    /// (developers.cloudflare.com/cloudflare-one/traffic-policies/dns-policies/).
+    /// Default: false
+    pub member_access: bool,
+    /// Whether a Bool field may be compared with `true` or `false`, as Cloudflare Gateway's
+    /// selectors are: `net.is_isolated == true`
+    /// (developers.cloudflare.com/cloudflare-one/traffic-policies/http-policies/).
+    /// Default: false
+    pub bool_literal_comparison: bool,
+    /// Whether a comparison over a map-each index outside `any(...)`, `all(...)` and function
+    /// arguments means `any(...)` of it, as in Cloudflare Gateway's
+    /// `net.src.ip[*] in {10.0.0.0/8}`
+    /// (developers.cloudflare.com/cloudflare-one/traffic-policies/network-policies/).
+    /// Default: false
+    pub implicit_any: bool,
+    /// Whether an IP or integer field may be compared with its literal in quotes, as Cloudflare
+    /// Gateway's selectors are: `http.conn.internal_src_ip == "192.168.86.0/27"` (in that range),
+    /// `net.src.port == "2222"`
+    /// (developers.cloudflare.com/cloudflare-one/traffic-policies/network-policies/).
+    /// Default: false
+    pub quoted_literals: bool,
+    /// Whether a comparison whose left-hand side is an array of scalars compares each element,
+    /// as `[*]` would, as Cloudflare Gateway's array selectors do:
+    /// `dns.authoritative_ns_ips == 198.51.100.0`, `net.sni.domains == "example.com"`,
+    /// `any(identity.saml_attributes["name"] in {"Test User"})`
+    /// (developers.cloudflare.com/cloudflare-one/traffic-policies/dns-policies/,
+    /// network-policies/).
+    /// Default: false
+    pub implicit_map_each: bool,
 }
 
 impl Default for ParserSettings {
@@ -126,6 +161,12 @@ impl Default for ParserSettings {
             regex_pool_capacity: 8,
             wildcard_star_limit: usize::MAX,
             max_nesting_depth: 128,
+            list_name_hyphens: false,
+            member_access: false,
+            bool_literal_comparison: false,
+            implicit_any: false,
+            quoted_literals: false,
+            implicit_map_each: false,
         }
     }
 }
@@ -136,6 +177,8 @@ pub struct FilterParser<'s> {
     pub(crate) scheme: &'s Scheme,
     pub(crate) settings: ParserSettings,
     current_nesting_depth: u16,
+    /// Inside a quantifier or a function argument, where a map-each comparison is an array.
+    pub(crate) in_array_argument: bool,
 }
 
 impl<'s> FilterParser<'s> {
@@ -146,6 +189,7 @@ impl<'s> FilterParser<'s> {
             scheme,
             settings: ParserSettings::default(),
             current_nesting_depth: 0,
+            in_array_argument: false,
         }
     }
 
@@ -156,6 +200,7 @@ impl<'s> FilterParser<'s> {
             scheme,
             settings,
             current_nesting_depth: 0,
+            in_array_argument: false,
         }
     }
 
@@ -190,6 +235,12 @@ impl<'s> FilterParser<'s> {
             nested.current_nesting_depth += 1;
             Ok(nested)
         }
+    }
+
+    #[inline]
+    pub(crate) fn in_array_argument(mut self) -> Self {
+        self.in_array_argument = true;
+        self
     }
 
     /// Parses a filter expression into an AST form.
